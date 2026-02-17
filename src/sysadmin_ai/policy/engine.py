@@ -1,220 +1,339 @@
-"""Open Policy Agent integration for declarative security policies."""
+"""Policy Engine - Core policy evaluation using OPA or local rules."""
 
 from __future__ import annotations
 
 import json
-import logging
-from dataclasses import dataclass
+import os
+import re
+from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import httpx
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
-logger = logging.getLogger(__name__)
+
+class PolicyAction(Enum):
+    """Policy enforcement actions."""
+    
+    ALLOW = "allow"
+    BLOCK = "block"
+    CONFIRM = "confirm"  # Graylist - requires user confirmation
+    LOG = "log"  # Allow but log for audit
+
+
+@dataclass
+class PolicyRule:
+    """A single policy rule."""
+    
+    name: str
+    description: str
+    pattern: str  # Regex pattern
+    action: PolicyAction
+    severity: str = "medium"  # low, medium, high, critical
+    metadata: dict[str, Any] = field(default_factory=dict)
+    
+    def __post_init__(self) -> None:
+        """Compile regex pattern."""
+        self._compiled = re.compile(self.pattern, re.IGNORECASE)
+    
+    def matches(self, command: str) -> bool:
+        """Check if command matches this rule."""
+        return bool(self._compiled.search(command))
 
 
 @dataclass
 class PolicyResult:
     """Result of policy evaluation."""
-
+    
     allowed: bool
-    reason: str | None = None
-    violations: list[str] | None = None
-    metadata: dict[str, Any] | None = None
+    action: PolicyAction
+    rule: PolicyRule | None = None
+    message: str = ""
+    context: dict[str, Any] = field(default_factory=dict)
+    
+    @property
+    def requires_confirmation(self) -> bool:
+        """Check if this result requires user confirmation."""
+        return self.action == PolicyAction.CONFIRM
 
 
 class PolicyEngine:
-    """Policy engine using Open Policy Agent (OPA).
-
-    Falls back to local Rego evaluation if OPA server is unavailable.
-    """
-
+    """Policy engine for evaluating commands against security policies."""
+    
     def __init__(
         self,
-        enabled: bool = True,
-        opa_url: str = "http://localhost:8181",
         policy_dir: str | Path | None = None,
-    ):
-        self.enabled = enabled
-        self.opa_url = opa_url.rstrip("/")
-        self.policy_dir = Path(policy_dir) if policy_dir else Path(__file__).parent / "../../../policies"
-        self.policy_dir = self.policy_dir.resolve()
+        opa_url: str | None = None,
+        use_opa: bool = False,
+    ) -> None:
+        """Initialize policy engine.
         
-        # Cache for loaded policies
-        self._policies: dict[str, str] = {}
-        self._opa_available: bool | None = None
-
-        if enabled:
-            self._load_policies()
-
-    def _load_policies(self) -> None:
-        """Load Rego policy files from policy directory."""
+        Args:
+            policy_dir: Directory containing policy files
+            opa_url: URL of OPA server (if using OPA)
+            use_opa: Whether to use OPA for policy evaluation
+        """
+        self.policy_dir = Path(policy_dir) if policy_dir else Path(__file__).parent / "../../../policies"
+        self.opa_url = opa_url or os.getenv("OPA_URL", "http://localhost:8181")
+        self.use_opa = use_opa
+        
+        self._rules: list[PolicyRule] = []
+        self._opa_available = False
+        
+        self._load_builtin_rules()
+        self._load_policy_files()
+        
+        if use_opa:
+            self._check_opa_availability()
+    
+    def _load_builtin_rules(self) -> None:
+        """Load built-in security rules."""
+        builtin_rules = [
+            # Destructive operations
+            PolicyRule(
+                name="rm_rf_root",
+                description="Block rm -rf / or similar destructive patterns",
+                pattern=r"rm\s+-[a-zA-Z]*f[a-zA-Z]*\s+.*(/\s*|/\.\s*$|/\*)",
+                action=PolicyAction.BLOCK,
+                severity="critical",
+            ),
+            PolicyRule(
+                name="mkfs_block",
+                description="Block filesystem formatting",
+                pattern=r"\bmkfs\.",
+                action=PolicyAction.BLOCK,
+                severity="critical",
+            ),
+            PolicyRule(
+                name="dd_to_disk",
+                description="Block dd to block devices",
+                pattern=r"\bdd\s+.*of=/dev/[sh]d",
+                action=PolicyAction.BLOCK,
+                severity="critical",
+            ),
+            # Credential access
+            PolicyRule(
+                name="shadow_access",
+                description="Block access to shadow password files",
+                pattern=r"\bcat\s+/etc/(shadow|gshadow)",
+                action=PolicyAction.BLOCK,
+                severity="high",
+            ),
+            PolicyRule(
+                name="ssh_key_access",
+                description="Block access to SSH private keys",
+                pattern=r"\bcat\s+.*/\.ssh/id_",
+                action=PolicyAction.BLOCK,
+                severity="high",
+            ),
+            # Privilege escalation
+            PolicyRule(
+                name="sudo_su",
+                description="Block sudo su attempts",
+                pattern=r"\bsudo\s+su\b",
+                action=PolicyAction.CONFIRM,
+                severity="high",
+            ),
+            # Network attacks
+            PolicyRule(
+                name="curl_pipe_bash",
+                description="Block curl | bash patterns",
+                pattern=r"curl\s+.*\|\s*(ba)?sh",
+                action=PolicyAction.CONFIRM,
+                severity="high",
+            ),
+            # System modification (graylist)
+            PolicyRule(
+                name="package_install",
+                description="Confirm package installations",
+                pattern=r"\b(apt|yum|dnf|pacman|pip|npm)\s+install",
+                action=PolicyAction.CONFIRM,
+                severity="medium",
+            ),
+            PolicyRule(
+                name="service_restart",
+                description="Confirm service restarts",
+                pattern=r"\bsystemctl\s+(restart|stop)",
+                action=PolicyAction.CONFIRM,
+                severity="medium",
+            ),
+            PolicyRule(
+                name="firewall_modify",
+                description="Confirm firewall modifications",
+                pattern=r"\b(iptables|ufw|firewalld)\s+.*(-A|--add|-D|--delete)",
+                action=PolicyAction.CONFIRM,
+                severity="high",
+            ),
+            # Kubernetes safety
+            PolicyRule(
+                name="kubectl_delete",
+                description="Block kubectl delete without confirmation",
+                pattern=r"\bkubectl\s+delete\s+.*--force|--grace-period=0",
+                action=PolicyAction.BLOCK,
+                severity="high",
+            ),
+            PolicyRule(
+                name="kubectl_secret_access",
+                description="Block kubectl get secret",
+                pattern=r"\bkubectl\s+get\s+secret",
+                action=PolicyAction.BLOCK,
+                severity="high",
+            ),
+        ]
+        self._rules.extend(builtin_rules)
+    
+    def _load_policy_files(self) -> None:
+        """Load policy rules from JSON files."""
         if not self.policy_dir.exists():
-            logger.warning(f"Policy directory not found: {self.policy_dir}")
             return
-
-        for policy_file in self.policy_dir.glob("*.rego"):
+        
+        for policy_file in self.policy_dir.glob("*.json"):
             try:
-                self._policies[policy_file.stem] = policy_file.read_text()
-                logger.debug(f"Loaded policy: {policy_file.name}")
-            except Exception as e:
-                logger.error(f"Failed to load policy {policy_file}: {e}")
-
-    async def _is_opa_available(self) -> bool:
+                with open(policy_file) as f:
+                    data = json.load(f)
+                
+                for rule_data in data.get("rules", []):
+                    rule = PolicyRule(
+                        name=rule_data["name"],
+                        description=rule_data["description"],
+                        pattern=rule_data["pattern"],
+                        action=PolicyAction(rule_data["action"]),
+                        severity=rule_data.get("severity", "medium"),
+                        metadata=rule_data.get("metadata", {}),
+                    )
+                    self._rules.append(rule)
+            except (json.JSONDecodeError, KeyError, ValueError) as e:
+                print(f"Warning: Failed to load policy file {policy_file}: {e}")
+    
+    def _check_opa_availability(self) -> None:
         """Check if OPA server is available."""
-        if self._opa_available is not None:
-            return self._opa_available
-
         try:
-            async with httpx.AsyncClient(timeout=2.0) as client:
-                response = await client.get(f"{self.opa_url}/health")
-                self._opa_available = response.status_code == 200
+            import httpx
+            response = httpx.get(f"{self.opa_url}/health", timeout=2.0)
+            self._opa_available = response.status_code == 200
         except Exception:
             self._opa_available = False
-
-        return self._opa_available
-
-    async def evaluate(
-        self,
-        command: str,
-        context: dict[str, Any],
-    ) -> PolicyResult:
-        """Evaluate a command against security policies.
-
+    
+    def evaluate(self, command: str, context: dict[str, Any] | None = None) -> PolicyResult:
+        """Evaluate a command against all policies.
+        
         Args:
             command: The command to evaluate
-            context: Additional context (user, environment, etc.)
-
+            context: Additional context (user, cwd, etc.)
+        
         Returns:
-            PolicyResult with allow/deny decision
+            PolicyResult with evaluation outcome
         """
-        if not self.enabled:
-            return PolicyResult(allowed=True)
-
-        # Try OPA server first
-        if await self._is_opa_available():
-            return await self._evaluate_with_opa(command, context)
-
-        # Fall back to local evaluation
-        return await self._evaluate_locally(command, context)
-
-    async def _evaluate_with_opa(
-        self,
-        command: str,
-        context: dict[str, Any],
-    ) -> PolicyResult:
-        """Evaluate using OPA server."""
-        input_data = {
-            "command": command,
-            "user": context.get("user", "anonymous"),
-            "environment": context.get("environment", {}),
-            "timestamp": context.get("timestamp"),
-        }
-
-        try:
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    f"{self.opa_url}/v1/data/sysadmin/allow",
-                    json={"input": input_data},
+        ctx = context or {}
+        
+        # Try OPA first if available
+        if self.use_opa and self._opa_available:
+            return self._evaluate_opa(command, ctx)
+        
+        # Fall back to local rule evaluation
+        return self._evaluate_local(command, ctx)
+    
+    def _evaluate_local(self, command: str, context: dict[str, Any]) -> PolicyResult:
+        """Evaluate using local rules."""
+        # Check rules in order of severity (critical first)
+        sorted_rules = sorted(
+            self._rules,
+            key=lambda r: {"critical": 0, "high": 1, "medium": 2, "low": 3}.get(r.severity, 4)
+        )
+        
+        for rule in sorted_rules:
+            if rule.matches(command):
+                return PolicyResult(
+                    allowed=rule.action in (PolicyAction.ALLOW, PolicyAction.LOG, PolicyAction.CONFIRM),
+                    action=rule.action,
+                    rule=rule,
+                    message=f"Policy '{rule.name}': {rule.description}",
+                    context={"command": command, **context},
                 )
-                response.raise_for_status()
-                data = response.json()
-
-                allowed = data.get("result", False)
+        
+        # No rules matched - allow by default
+        return PolicyResult(
+            allowed=True,
+            action=PolicyAction.ALLOW,
+            message="No policy restrictions apply",
+            context={"command": command, **context},
+        )
+    
+    def _evaluate_opa(self, command: str, context: dict[str, Any]) -> PolicyResult:
+        """Evaluate using OPA server."""
+        try:
+            import httpx
+            
+            input_data = {
+                "input": {
+                    "command": command,
+                    **context,
+                }
+            }
+            
+            response = httpx.post(
+                f"{self.opa_url}/v1/data/sysadmin_ai/allow",
+                json=input_data,
+                timeout=5.0,
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                allowed = result.get("result", False)
+                
                 return PolicyResult(
                     allowed=allowed,
-                    reason="OPA evaluation" if allowed else "Policy denied",
-                    metadata={"source": "opa"},
+                    action=PolicyAction.ALLOW if allowed else PolicyAction.BLOCK,
+                    message="OPA policy evaluation" if allowed else "OPA policy denied",
+                    context={"command": command, "opa_result": result, **context},
                 )
+            else:
+                # Fall back to local evaluation on OPA error
+                return self._evaluate_local(command, context)
         except Exception as e:
-            logger.warning(f"OPA evaluation failed, falling back: {e}")
-            return await self._evaluate_locally(command, context)
-
-    async def _evaluate_locally(
-        self,
-        command: str,
-        context: dict[str, Any],
-    ) -> PolicyResult:
-        """Evaluate policies locally without OPA server."""
-        violations = []
-
-        # Built-in security policies
-        if self._is_dangerous_command(command):
-            violations.append("Command matches dangerous pattern")
-
-        if self._has_destructive_flags(command):
-            violations.append("Command has destructive flags")
-
-        if self._accesses_sensitive_paths(command):
-            violations.append("Command accesses sensitive paths")
-
-        # Check user permissions from context
-        user_perms = context.get("permissions", [])
-        if "admin" not in user_perms and self._requires_admin(command):
-            violations.append("Command requires admin privileges")
-
-        return PolicyResult(
-            allowed=len(violations) == 0,
-            reason="Local policy evaluation",
-            violations=violations if violations else None,
-            metadata={"source": "local", "checks_performed": 4},
-        )
-
-    def _is_dangerous_command(self, command: str) -> bool:
-        """Check if command is inherently dangerous."""
-        dangerous = [
-            "rm -rf /",
-            "mkfs.",
-            "dd if=/dev/zero",
-            ":(){ :|:& };:",  # Fork bomb
-            "> /dev/sda",
-            "mv / /dev/null",
-        ]
-        cmd_lower = command.lower()
-        return any(d in cmd_lower for d in dangerous)
-
-    def _has_destructive_flags(self, command: str) -> bool:
-        """Check for destructive command flags."""
-        destructive_patterns = [
-            "rm -rf",
-            "rm -f /",
-            "rm --no-preserve-root",
-        ]
-        cmd_lower = command.lower()
-        return any(p in cmd_lower for p in destructive_patterns)
-
-    def _accesses_sensitive_paths(self, command: str) -> bool:
-        """Check if command accesses sensitive system paths."""
-        sensitive_paths = [
-            "/etc/shadow",
-            "/etc/passwd",
-            "/etc/ssh",
-            "/root/",
-            "/var/log",
-        ]
-        return any(path in command for path in sensitive_paths)
-
-    def _requires_admin(self, command: str) -> bool:
-        """Check if command typically requires admin privileges."""
-        admin_commands = [
-            "useradd", "userdel", "usermod",
-            "groupadd", "groupdel", "groupmod",
-            "fdisk", "mkfs", "mount", "umount",
-            "systemctl", "service",
-            "apt-get", "yum", "dnf", "pacman",
-        ]
-        cmd_parts = command.split()
-        if not cmd_parts:
-            return False
-        base_cmd = cmd_parts[0].split("/")[-1]
-        return base_cmd in admin_commands
-
-    def reload_policies(self) -> None:
-        """Reload policies from disk."""
-        self._policies.clear()
-        self._load_policies()
-        logger.info("Policies reloaded")
-
-    def get_loaded_policies(self) -> list[str]:
-        """Get list of loaded policy names."""
-        return list(self._policies.keys())
+            # Fall back to local evaluation on OPA error
+            return PolicyResult(
+                allowed=False,
+                action=PolicyAction.BLOCK,
+                message=f"OPA evaluation failed: {e}",
+                context={"command": command, "error": str(e), **context},
+            )
+    
+    def add_rule(self, rule: PolicyRule) -> None:
+        """Add a custom rule to the engine."""
+        self._rules.append(rule)
+    
+    def remove_rule(self, name: str) -> bool:
+        """Remove a rule by name."""
+        for i, rule in enumerate(self._rules):
+            if rule.name == name:
+                self._rules.pop(i)
+                return True
+        return False
+    
+    def list_rules(self) -> list[PolicyRule]:
+        """List all loaded rules."""
+        return self._rules.copy()
+    
+    def dry_run(self, command: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Simulate policy evaluation without enforcement.
+        
+        Returns detailed information about what would happen.
+        """
+        result = self.evaluate(command, context)
+        
+        return {
+            "command": command,
+            "would_execute": result.allowed and not result.requires_confirmation,
+            "requires_confirmation": result.requires_confirmation,
+            "action": result.action.value,
+            "rule_matched": result.rule.name if result.rule else None,
+            "message": result.message,
+            "all_matching_rules": [
+                {"name": r.name, "action": r.action.value, "severity": r.severity}
+                for r in self._rules
+                if r.matches(command)
+            ],
+        }
