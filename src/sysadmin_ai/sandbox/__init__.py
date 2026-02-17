@@ -1,5 +1,5 @@
-"""Sandbox management for multi-user session isolation."""
+"""Sandbox module for session isolation."""
 
-from .manager import SandboxManager, SandboxConfig, Sandbox
+from sysadmin_ai.sandbox.manager import Sandbox, SandboxConfig, SandboxManager
 
-__all__ = ["SandboxManager", "SandboxConfig", "Sandbox"]
+__all__ = ["SandboxManager", "Sandbox", "SandboxConfig"]

@@ -1,6 +1,6 @@
-"""Plugin system for extensible executors and tools."""
+"""Plugin system module."""
 
-from .manager import PluginManager
-from .base import Plugin, ExecutorPlugin, ToolPlugin
+from sysadmin_ai.plugins.base import Plugin
+from sysadmin_ai.plugins.manager import PluginManager
 
-__all__ = ["PluginManager", "Plugin", "ExecutorPlugin", "ToolPlugin"]
+__all__ = ["Plugin", "PluginManager"]

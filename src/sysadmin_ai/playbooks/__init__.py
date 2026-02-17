@@ -1,5 +1,5 @@
-"""Playbook generation for exporting sessions as Ansible/Terraform."""
+"""Playbook generation module."""
 
-from .generator import PlaybookGenerator
+from sysadmin_ai.playbooks.generator import CommandRecord, PlaybookGenerator
 
-__all__ = ["PlaybookGenerator"]
+__all__ = ["PlaybookGenerator", "CommandRecord"]

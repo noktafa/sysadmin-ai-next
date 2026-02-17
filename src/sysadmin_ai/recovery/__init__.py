@@ -1,5 +1,5 @@
-"""Fuzzy command recovery for suggesting safe alternatives."""
+"""Recovery module for fuzzy command suggestions."""
 
-from .recovery import RecoveryEngine, CommandSuggestion
+from sysadmin_ai.recovery.recovery import CommandSuggestion, RecoveryEngine
 
 __all__ = ["RecoveryEngine", "CommandSuggestion"]
