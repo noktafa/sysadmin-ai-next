@@ -1,107 +1,51 @@
-"""Base plugin classes."""
+"""Plugin system for custom executors."""
 
 from __future__ import annotations
 
+import importlib.metadata
+import logging
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-if TYPE_CHECKING:
-    from collections.abc import Callable
-
-
-@dataclass
-class PluginMetadata:
-    """Plugin metadata."""
-    
-    name: str
-    version: str
-    description: str
-    author: str
-    requires: list[str] = None
-    
-    def __post_init__(self) -> None:
-        if self.requires is None:
-            self.requires = []
+logger = logging.getLogger(__name__)
 
 
 class Plugin(ABC):
-    """Base plugin class."""
-    
-    metadata: PluginMetadata
-    
-    def __init__(self) -> None:
-        """Initialize plugin."""
-        pass
-    
-    @abstractmethod
-    def initialize(self, config: dict[str, Any]) -> None:
-        """Initialize plugin with configuration."""
-        pass
-    
-    @abstractmethod
-    def shutdown(self) -> None:
-        """Clean up plugin resources."""
-        pass
+    """Base class for SysAdmin AI plugins."""
 
+    name: str = ""
+    version: str = "0.1.0"
+    description: str = ""
 
-class ExecutorPlugin(Plugin):
-    """Plugin for custom command executors."""
-    
     @abstractmethod
-    def execute(
-        self,
-        command: str,
-        cwd: str | None = None,
-        env: dict[str, str] | None = None,
-        timeout: int = 30,
-    ) -> dict[str, Any]:
+    async def execute(self, command: str, context: dict[str, Any]) -> dict[str, Any]:
         """Execute a command.
-        
+
         Args:
-            command: Command to execute
-            cwd: Working directory
-            env: Environment variables
-            timeout: Timeout in seconds
-        
+            command: The command to execute
+            context: Execution context
+
         Returns:
-            Execution result with stdout, stderr, exit_code, etc.
+            Execution result
         """
-        pass
-    
-    @abstractmethod
-    def is_available(self) -> bool:
-        """Check if this executor is available in the current environment."""
-        pass
-    
-    @property
-    @abstractmethod
-    def name(self) -> str:
-        """Executor name."""
         pass
 
+    @abstractmethod
+    def can_handle(self, command: str) -> bool:
+        """Check if this plugin can handle the given command.
 
-class ToolPlugin(Plugin):
-    """Plugin for custom tools/functions."""
-    
-    @abstractmethod
-    def get_tools(self) -> list[dict[str, Any]]:
-        """Get tool definitions for LLM.
-        
-        Returns:
-            List of tool definitions in OpenAI function format
-        """
-        pass
-    
-    @abstractmethod
-    def execute_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        """Execute a tool.
-        
         Args:
-            tool_name: Name of the tool to execute
-            arguments: Tool arguments
-        
+            command: The command to check
+
         Returns:
-            Tool execution result
+            True if this plugin can handle the command
         """
         pass
+
+    def get_info(self) -> dict[str, Any]:
+        """Get plugin information."""
+        return {
+            "name": self.name,
+            "version": self.version,
+            "description": self.description,
+        }
